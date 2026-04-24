@@ -1,11 +1,5 @@
 package com.pipelinesync;
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  PipelineSync — Spring Boot Backend (single-file architecture)
-//  Handles: WebHooks → Kafka → Redis Pub/Sub → WebSocket → PostgreSQL
-// ═══════════════════════════════════════════════════════════════════════════════
-
-import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.persistence.*;
@@ -16,12 +10,14 @@ import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.redis.connection.MessageListener;
 import org.springframework.data.redis.connection.RedisConnectionFactory;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.listener.*;
 import org.springframework.http.*;
 import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.kafka.support.KafkaHeaders;
 import org.springframework.messaging.handler.annotation.*;
 import org.springframework.messaging.simp.SimpMessagingTemplate;
 import org.springframework.messaging.simp.config.MessageBrokerRegistry;
@@ -105,9 +101,9 @@ class PipelineRun {
     private String commitSha;
     private String commitMessage;
     private String author;
-    private String runId;          // GitHub Actions run ID
-    private String status;         // queued, in_progress, completed
-    private String conclusion;     // success, failure, cancelled, null
+    private String runId;
+    private String status;
+    private String conclusion;
     private Instant triggeredAt;
     private Instant updatedAt;
 }
@@ -117,14 +113,14 @@ class Annotation {
     @Id @GeneratedValue(strategy = GenerationType.IDENTITY)
     private Long id;
     private Long pipelineRunId;
-    private String jobName;        // which CI job/step
+    private String jobName;
     private String author;
     private String content;
-    private String type;           // comment, warning, error, info
+    private String type;
     private boolean resolved;
-    private Long parentId;         // for threading
+    private Long parentId;
     @Version
-    private Long version;          // optimistic locking
+    private Long version;
     private Instant createdAt;
     private Instant updatedAt;
 }
@@ -190,7 +186,7 @@ class PipelineEventConsumer {
 
     @KafkaListener(topics = "github-pipeline-events", groupId = "pipelinesync-group")
     void consume(
-            @org.springframework.kafka.support.KafkaHeaders.ReceivedKey String event,
+            @Header(KafkaHeaders.RECEIVED_KEY) String event,
             @Payload String body) throws Exception {
 
         JsonNode root = mapper.readTree(body);
@@ -216,7 +212,6 @@ class PipelineEventConsumer {
             run.setUpdatedAt(Instant.now());
             runs.save(run);
 
-            // Fan out via Redis Pub/Sub
             redis.convertAndSend("pipeline:" + repo,
                 mapper.writeValueAsString(Map.of("type", "PIPELINE_UPDATE", "payload", run)));
         }
@@ -253,7 +248,6 @@ class ApiController {
     private final SimpMessagingTemplate ws;
     private final ObjectMapper mapper;
 
-    // Repos — list recent repos seen
     @GetMapping("/repos")
     List<String> repos() {
         return runs.findAll().stream()
@@ -263,13 +257,11 @@ class ApiController {
             .toList();
     }
 
-    // Pipeline runs for a repo
     @GetMapping("/pipelines")
     List<PipelineRun> pipelines(@RequestParam String repo) {
         return runs.findByRepoOrderByTriggeredAtDesc(repo);
     }
 
-    // Simulate a pipeline run (for demo without real GitHub)
     @PostMapping("/pipelines/simulate")
     PipelineRun simulate(@RequestBody Map<String, String> body) {
         String repo = body.getOrDefault("repo", "demo/app");
@@ -287,7 +279,6 @@ class ApiController {
         return runs.save(run);
     }
 
-    // Annotations CRUD
     @GetMapping("/pipelines/{id}/annotations")
     List<Annotation> getAnnotations(@PathVariable Long id) {
         return annotations.findByPipelineRunIdOrderByCreatedAtAsc(id);
@@ -308,7 +299,6 @@ class ApiController {
             .build();
         Annotation saved = annotations.save(a);
 
-        // Broadcast new annotation via WebSocket
         runs.findById(id).ifPresent(run -> {
             try {
                 String topic = "/topic/pipeline/" + run.getRepo().replace("/", "_");
@@ -327,7 +317,6 @@ class ApiController {
         return annotations.save(a);
     }
 
-    // GitHub API proxy — fetch workflow runs for a repo
     @GetMapping("/github/runs")
     Mono<String> githubRuns(
             @RequestParam String repo,
@@ -337,14 +326,12 @@ class ApiController {
             .defaultHeader("Authorization", "Bearer " + token)
             .defaultHeader("Accept", "application/vnd.github+json")
             .build();
-
         return client.get()
             .uri("/repos/{repo}/actions/runs?per_page=20", repo)
             .retrieve()
             .bodyToMono(String.class);
     }
 
-    // GitHub API proxy — fetch jobs for a run
     @GetMapping("/github/runs/{runId}/jobs")
     Mono<String> githubJobs(
             @PathVariable String runId,
@@ -355,7 +342,6 @@ class ApiController {
             .defaultHeader("Authorization", "Bearer " + token)
             .defaultHeader("Accept", "application/vnd.github+json")
             .build();
-
         return client.get()
             .uri("/repos/{repo}/actions/runs/{runId}/jobs", repo, runId)
             .retrieve()
@@ -363,7 +349,7 @@ class ApiController {
     }
 }
 
-// ─── WebSocket Message Handler (annotation from WS) ──────────────────────────
+// ─── WebSocket Message Handler ────────────────────────────────────────────────
 @Controller
 @RequiredArgsConstructor
 class WsAnnotationController {
