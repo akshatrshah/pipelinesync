@@ -3,7 +3,8 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 import { useState, useEffect, useRef, useCallback } from "react";
 import { Client } from "@stomp/stompjs";
-import SockJS from "sockjs-client";
+// @ts-ignore
+import SockJS from "sockjs-client/dist/sockjs";
 import { formatDistanceToNow } from "date-fns";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
