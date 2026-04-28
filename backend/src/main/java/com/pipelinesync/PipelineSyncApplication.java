@@ -1,5 +1,11 @@
 package com.pipelinesync;
 
+// ═══════════════════════════════════════════════════════════════════════════════
+//  PipelineSync — Spring Boot Backend (single-file architecture)
+//  Handles: WebHooks → Kafka → Redis Pub/Sub → WebSocket → PostgreSQL
+// ═══════════════════════════════════════════════════════════════════════════════
+
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.persistence.*;
@@ -10,14 +16,13 @@ import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.data.jpa.repository.JpaRepository;
-import org.springframework.data.redis.connection.MessageListener;
 import org.springframework.data.redis.connection.RedisConnectionFactory;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.listener.*;
+import org.springframework.data.redis.connection.MessageListener;
 import org.springframework.http.*;
 import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.kafka.core.KafkaTemplate;
-import org.springframework.kafka.support.KafkaHeaders;
 import org.springframework.messaging.handler.annotation.*;
 import org.springframework.messaging.simp.SimpMessagingTemplate;
 import org.springframework.messaging.simp.config.MessageBrokerRegistry;
@@ -101,9 +106,9 @@ class PipelineRun {
     private String commitSha;
     private String commitMessage;
     private String author;
-    private String runId;
-    private String status;
-    private String conclusion;
+    private String runId;          // GitHub Actions run ID
+    private String status;         // queued, in_progress, completed
+    private String conclusion;     // success, failure, cancelled, null
     private Instant triggeredAt;
     private Instant updatedAt;
 }
@@ -113,14 +118,14 @@ class Annotation {
     @Id @GeneratedValue(strategy = GenerationType.IDENTITY)
     private Long id;
     private Long pipelineRunId;
-    private String jobName;
+    private String jobName;        // which CI job/step
     private String author;
     private String content;
-    private String type;
+    private String type;           // comment, warning, error, info
     private boolean resolved;
-    private Long parentId;
+    private Long parentId;         // for threading
     @Version
-    private Long version;
+    private Long version;          // optimistic locking
     private Instant createdAt;
     private Instant updatedAt;
 }
@@ -186,7 +191,7 @@ class PipelineEventConsumer {
 
     @KafkaListener(topics = "github-pipeline-events", groupId = "pipelinesync-group")
     void consume(
-            @Header(KafkaHeaders.RECEIVED_KEY) String event,
+            @org.springframework.messaging.handler.annotation.Header(org.springframework.kafka.support.KafkaHeaders.RECEIVED_KEY) String event,
             @Payload String body) throws Exception {
 
         JsonNode root = mapper.readTree(body);
@@ -212,6 +217,7 @@ class PipelineEventConsumer {
             run.setUpdatedAt(Instant.now());
             runs.save(run);
 
+            // Fan out via Redis Pub/Sub
             redis.convertAndSend("pipeline:" + repo,
                 mapper.writeValueAsString(Map.of("type", "PIPELINE_UPDATE", "payload", run)));
         }
@@ -248,6 +254,7 @@ class ApiController {
     private final SimpMessagingTemplate ws;
     private final ObjectMapper mapper;
 
+    // Repos — list recent repos seen
     @GetMapping("/repos")
     List<String> repos() {
         return runs.findAll().stream()
@@ -257,28 +264,33 @@ class ApiController {
             .toList();
     }
 
+    // Pipeline runs for a repo
     @GetMapping("/pipelines")
     List<PipelineRun> pipelines(@RequestParam String repo) {
         return runs.findByRepoOrderByTriggeredAtDesc(repo);
     }
 
+    // Simulate a pipeline run (for demo without real GitHub)
     @PostMapping("/pipelines/simulate")
     PipelineRun simulate(@RequestBody Map<String, String> body) {
         String repo = body.getOrDefault("repo", "demo/app");
-        PipelineRun run = PipelineRun.builder()
-            .runId(UUID.randomUUID().toString())
-            .repo(repo)
-            .branch(body.getOrDefault("branch", "main"))
-            .commitSha(UUID.randomUUID().toString().substring(0, 7))
-            .commitMessage(body.getOrDefault("message", "feat: add new feature"))
-            .author(body.getOrDefault("author", "dev"))
-            .status("in_progress")
-            .triggeredAt(Instant.now())
-            .updatedAt(Instant.now())
-            .build();
+        String runId = body.getOrDefault("runId", UUID.randomUUID().toString());
+        PipelineRun run = runs.findByRunId(runId).orElse(
+            PipelineRun.builder()
+                .runId(runId).repo(repo)
+                .branch(body.getOrDefault("branch", "main"))
+                .commitSha(UUID.randomUUID().toString().substring(0, 7))
+                .commitMessage(body.getOrDefault("message", "feat: add new feature"))
+                .author(body.getOrDefault("author", "dev"))
+                .triggeredAt(Instant.now()).build()
+        );
+        run.setStatus(body.getOrDefault("status", "in_progress"));
+        run.setConclusion(body.get("conclusion"));
+        run.setUpdatedAt(Instant.now());
         return runs.save(run);
     }
 
+    // Annotations CRUD
     @GetMapping("/pipelines/{id}/annotations")
     List<Annotation> getAnnotations(@PathVariable Long id) {
         return annotations.findByPipelineRunIdOrderByCreatedAtAsc(id);
@@ -299,6 +311,7 @@ class ApiController {
             .build();
         Annotation saved = annotations.save(a);
 
+        // Broadcast new annotation via WebSocket
         runs.findById(id).ifPresent(run -> {
             try {
                 String topic = "/topic/pipeline/" + run.getRepo().replace("/", "_");
@@ -317,39 +330,53 @@ class ApiController {
         return annotations.save(a);
     }
 
-    @GetMapping("/github/runs")
-    Mono<String> githubRuns(
-            @RequestParam String repo,
-            @Value("${github.token}") String token) {
-        WebClient client = WebClient.builder()
-            .baseUrl("https://api.github.com")
-            .defaultHeader("Authorization", "Bearer " + token)
-            .defaultHeader("Accept", "application/vnd.github+json")
-            .build();
-        return client.get()
-            .uri("/repos/{repo}/actions/runs?per_page=20", repo)
-            .retrieve()
-            .bodyToMono(String.class);
-    }
-
-    @GetMapping("/github/runs/{runId}/jobs")
-    Mono<String> githubJobs(
-            @PathVariable String runId,
-            @RequestParam String repo,
-            @Value("${github.token}") String token) {
-        WebClient client = WebClient.builder()
-            .baseUrl("https://api.github.com")
-            .defaultHeader("Authorization", "Bearer " + token)
-            .defaultHeader("Accept", "application/vnd.github+json")
-            .build();
-        return client.get()
-            .uri("/repos/{repo}/actions/runs/{runId}/jobs", repo, runId)
-            .retrieve()
-            .bodyToMono(String.class);
-    }
+// GitHub API proxy — fetch workflow runs for a repo
+@GetMapping("/github/runs")
+Mono<ResponseEntity<String>> githubRuns(
+        @RequestParam String repo,
+        @Value("${github.token}") String token) {
+    String url = "https://api.github.com/repos/" + repo + "/actions/runs?per_page=20";
+    WebClient client = WebClient.builder()
+        .defaultHeader("Authorization", "Bearer " + token)
+        .defaultHeader("Accept", "application/vnd.github+json")
+        .build();
+    return client.get()
+        .uri(url)
+        .retrieve()
+        .onStatus(status -> status.isError(), resp ->
+            resp.bodyToMono(String.class).map(body ->
+                new RuntimeException("GitHub error " + resp.statusCode() + ": " + body)))
+        .bodyToMono(String.class)
+        .map(body -> ResponseEntity.ok(body))
+        .onErrorResume(e -> Mono.just(ResponseEntity.status(502)
+            .body("{\"error\":\"" + e.getMessage().replace("\"", "'") + "\"}")));
 }
 
-// ─── WebSocket Message Handler ────────────────────────────────────────────────
+// GitHub API proxy — fetch jobs for a run
+@GetMapping("/github/runs/{runId}/jobs")
+Mono<ResponseEntity<String>> githubJobs(
+        @PathVariable String runId,
+        @RequestParam String repo,
+        @Value("${github.token}") String token) {
+    String url = "https://api.github.com/repos/" + repo + "/actions/runs/" + runId + "/jobs";
+    WebClient client = WebClient.builder()
+        .defaultHeader("Authorization", "Bearer " + token)
+        .defaultHeader("Accept", "application/vnd.github+json")
+        .build();
+    return client.get()
+        .uri(url)
+        .retrieve()
+        .onStatus(status -> status.isError(), resp ->
+            resp.bodyToMono(String.class).map(body ->
+                new RuntimeException("GitHub error " + resp.statusCode() + ": " + body)))
+        .bodyToMono(String.class)
+        .map(body -> ResponseEntity.ok(body))
+        .onErrorResume(e -> Mono.just(ResponseEntity.status(502)
+            .body("{\"error\":\"" + e.getMessage().replace("\"", "'") + "\"}")));
+}
+}
+
+// ─── WebSocket Message Handler (annotation from WS) ──────────────────────────
 @Controller
 @RequiredArgsConstructor
 class WsAnnotationController {
